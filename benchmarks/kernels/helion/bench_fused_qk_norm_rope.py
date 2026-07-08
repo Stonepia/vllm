@@ -55,6 +55,7 @@ import argparse
 import math
 
 import torch
+from bench_utils import bench_with_xpu_graph_fallback, print_detailed_report
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.kernels.helion.ops.fused_qk_norm_rope import (
@@ -66,7 +67,6 @@ from vllm.kernels.helion.ops.fused_qk_norm_rope import (
 )
 from vllm.kernels.helion.register import create_helion_decorated_kernel
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
 
 BF16 = torch.bfloat16
 DEVICE = current_platform.device_type
@@ -152,8 +152,8 @@ def make_inputs(num_q_heads: int, num_kv_heads: int) -> tuple[torch.Tensor, tupl
     return qkv, rest
 
 
-def bench(fn) -> float:
-    return triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
+def bench(fn) -> tuple[float, bool]:
+    return bench_with_xpu_graph_fallback(fn)
 
 
 def rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -201,6 +201,7 @@ def main() -> None:
     kernel = build_kernel(args.autotune_effort, args.autotune_budget_seconds)
 
     rows = []
+    detailed_rows: list[tuple[str, float, float]] = []
     for name, (num_q_heads, num_kv_heads) in MODEL_HEADS.items():
         qkv, rest = make_inputs(num_q_heads, num_kv_heads)
 
@@ -215,21 +216,29 @@ def main() -> None:
         err = rel_err(test_qkv, compiled_qkv)
 
         compiled_buf = qkv.clone()
-        compiled_ms = bench(
+        compiled_ms, compiled_graph = bench(
             lambda buf=compiled_buf, r=rest: _COMPILED_BASELINE(buf, *r)
         )
 
         kern_buf = qkv.clone()
-        kern_ms = bench(lambda buf=kern_buf, r=rest: kernel(buf, *r))
+        kern_ms, kern_graph = bench(lambda buf=kern_buf, r=rest: kernel(buf, *r))
+        xpu_graph_enabled = compiled_graph and kern_graph
         speedup_vs_compiled = compiled_ms / kern_ms if kern_ms > 0 else 0.0
 
         ops_c_ms = None
         speedup_vs_ops_c = None
         if torch_ops_c_available:
             opsc_buf = qkv.clone()
-            ops_c_ms = bench(lambda buf=opsc_buf, r=rest: torch_ops_c_baseline(buf, *r))
+            ops_c_ms, _ = bench(
+                lambda buf=opsc_buf, r=rest: torch_ops_c_baseline(buf, *r)
+            )
             speedup_vs_ops_c = ops_c_ms / kern_ms if kern_ms > 0 else 0.0
 
+        case_name = (
+            f"num_q_heads_{num_q_heads}_num_kv_heads_{num_kv_heads}_"
+            f"num_tokens_{NUM_TOKENS}"
+        )
+        detailed_rows.append((case_name, compiled_ms, kern_ms))
         rows.append(
             (
                 name,
@@ -239,29 +248,31 @@ def main() -> None:
                 kern_ms,
                 speedup_vs_ops_c,
                 speedup_vs_compiled,
+                xpu_graph_enabled,
             )
         )
         ops_c_str = f"{ops_c_ms:9.5f}" if ops_c_ms is not None else "      N/A"
         speedup_c_str = (
             f"{speedup_vs_ops_c:6.3f}x" if speedup_vs_ops_c is not None else "    N/A"
         )
+        xpu_graph_str = "enabled" if xpu_graph_enabled else "disabled (fallback)"
         print(
             f"{name:12s} num_q_heads={num_q_heads:3d} num_kv_heads={num_kv_heads:2d} "
             f"num_tokens={NUM_TOKENS:5d}  rel_err={err:.4f}  "
             f"compiled_ms={compiled_ms:9.5f}  ops_c_ms={ops_c_str}  "
             f"helion_ms={kern_ms:9.5f}  "
             f"speedup_vs_compiled={speedup_vs_compiled:6.3f}x  "
-            f"speedup_vs_ops_c={speedup_c_str}"
+            f"speedup_vs_ops_c={speedup_c_str}  xpu_graph={xpu_graph_str}"
         )
 
-    speedups_compiled = [r[-1] for r in rows if r[-1] > 0]
+    speedups_compiled = [r[-2] for r in rows if r[-2] > 0]
     if speedups_compiled:
         geo = math.exp(sum(math.log(s) for s in speedups_compiled) / len(rows))
         print(
             f"\ngeomean speedup vs torch.compile(native) over "
             f"{len(rows)} shapes: {geo:.3f}x"
         )
-    speedups_ops_c = [r[-2] for r in rows if r[-2] is not None and r[-2] > 0]
+    speedups_ops_c = [r[-3] for r in rows if r[-3] is not None and r[-3] > 0]
     if speedups_ops_c:
         geo_c = math.exp(sum(math.log(s) for s in speedups_ops_c) / len(rows))
         print(f"geomean speedup vs torch.ops._C over {len(rows)} shapes: {geo_c:.3f}x")
@@ -269,6 +280,14 @@ def main() -> None:
         print("torch.ops._C: N/A on this platform")
     max_err = max((r[1] for r in rows), default=0.0)
     print(f"max rel_err across all shapes: {max_err:.4f}")
+    n_graph_enabled = sum(1 for r in rows if r[-1])
+    print(f"xpu_graph enabled for {n_graph_enabled}/{len(rows)} shapes")
+
+    print_detailed_report(
+        hardware=current_platform.get_device_name(),
+        baseline_name="torch.compile(baseline)",
+        rows=detailed_rows,
+    )
 
 
 if __name__ == "__main__":

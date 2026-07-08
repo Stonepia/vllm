@@ -36,6 +36,7 @@ import dataclasses
 import math
 
 import torch
+from bench_utils import bench_with_xpu_graph_fallback, print_detailed_report
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.kernels.helion.ops.dynamic_per_token_scaled_fp8_quant import (
@@ -45,7 +46,6 @@ from vllm.kernels.helion.register import create_helion_decorated_kernel
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
 
 FP8 = current_platform.fp8_dtype()
 BF16 = torch.bfloat16
@@ -141,8 +141,8 @@ def make_inputs(
     return result, input, scale, scale_ub
 
 
-def bench(fn) -> float:
-    return triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
+def bench(fn) -> tuple[float, bool]:
+    return bench_with_xpu_graph_fallback(fn)
 
 
 def rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -204,8 +204,11 @@ def main() -> None:
 
     kernel = build_kernel(args.autotune_effort, args.autotune_budget_seconds)
 
-    rows: list[tuple[str, int, int, float, float, float | None, float, float | None]]
+    rows: list[
+        tuple[str, int, int, float, float, float | None, float, float | None, bool]
+    ]
     rows = []
+    detailed_rows: list[tuple[str, float, float]] = []
     for name, hidden_size in HIDDEN_SIZES.items():
         result, input, scale, scale_ub = make_inputs(NUM_TOKENS, hidden_size)
         call_args = (result, input, scale, scale_ub)
@@ -222,12 +225,13 @@ def main() -> None:
             rel_err(kernel_out, compiled_out), rel_err(kernel_scale, compiled_scale)
         )
 
-        compiled_ms = bench(
+        compiled_ms, compiled_graph = bench(
             lambda co=compiled_out, i=input, cs=compiled_scale, su=scale_ub: (
                 torch_compile_baseline(co, i, cs, su)
             )
         )
-        kern_ms = bench(lambda ca=call_args: kernel(*ca))
+        kern_ms, kern_graph = bench(lambda ca=call_args: kernel(*ca))
+        xpu_graph_enabled = compiled_graph and kern_graph
         speedup_vs_compiled = compiled_ms / kern_ms if kern_ms > 0 else 0.0
 
         ops_c_ms = None
@@ -237,13 +241,15 @@ def main() -> None:
             opsc_scale = torch.empty_like(scale)
             torch_ops_c_baseline(opsc_out, input, opsc_scale, scale_ub)
             torch.xpu.synchronize()
-            ops_c_ms = bench(
+            ops_c_ms, _ = bench(
                 lambda oo=opsc_out, i=input, os_=opsc_scale, su=scale_ub: (
                     torch_ops_c_baseline(oo, i, os_, su)
                 )
             )
             speedup_vs_ops_c = ops_c_ms / kern_ms if kern_ms > 0 else 0.0
 
+        case_name = f"hidden_size_{hidden_size}_num_tokens_{NUM_TOKENS}"
+        detailed_rows.append((case_name, compiled_ms, kern_ms))
         rows.append(
             (
                 name,
@@ -255,28 +261,30 @@ def main() -> None:
                 kern_ms,
                 speedup_vs_ops_c,
                 speedup_vs_compiled,
+                xpu_graph_enabled,
             )
         )
         ops_c_str = f"{ops_c_ms:9.5f}" if ops_c_ms is not None else "      N/A"
         speedup_c_str = (
             f"{speedup_vs_ops_c:6.3f}x" if speedup_vs_ops_c is not None else "    N/A"
         )
+        xpu_graph_str = "enabled" if xpu_graph_enabled else "disabled (fallback)"
         print(
             f"{name:12s} num_tokens={NUM_TOKENS:5d} hidden_size={hidden_size:6d}  "
             f"rel_err={err:.4f}  compiled_ms={compiled_ms:9.5f}  "
             f"ops_c_ms={ops_c_str}  helion_ms={kern_ms:9.5f}  "
             f"speedup_vs_compiled={speedup_vs_compiled:6.3f}x  "
-            f"speedup_vs_ops_c={speedup_c_str}"
+            f"speedup_vs_ops_c={speedup_c_str}  xpu_graph={xpu_graph_str}"
         )
 
-    speedups_compiled = [r[-1] for r in rows if r[-1] > 0]
+    speedups_compiled = [r[-2] for r in rows if r[-2] > 0]
     if speedups_compiled:
         geo = math.exp(sum(math.log(s) for s in speedups_compiled) / len(rows))
         print(
             f"\ngeomean speedup vs torch.compile(native) over "
             f"{len(rows)} shapes: {geo:.3f}x"
         )
-    speedups_ops_c = [r[-2] for r in rows if r[-2] is not None and r[-2] > 0]
+    speedups_ops_c = [r[-3] for r in rows if r[-3] is not None and r[-3] > 0]
     if speedups_ops_c:
         geo_c = math.exp(sum(math.log(s) for s in speedups_ops_c) / len(rows))
         print(f"geomean speedup vs torch.ops._C over {len(rows)} shapes: {geo_c:.3f}x")
@@ -284,6 +292,14 @@ def main() -> None:
         print("torch.ops._C: N/A on this platform")
     max_err = max((r[3] for r in rows), default=0.0)
     print(f"max rel_err across all shapes: {max_err:.4f}")
+    n_graph_enabled = sum(1 for r in rows if r[-1])
+    print(f"xpu_graph enabled for {n_graph_enabled}/{len(rows)} shapes")
+
+    print_detailed_report(
+        hardware=current_platform.get_device_name(),
+        baseline_name="torch.compile(native_impl)",
+        rows=detailed_rows,
+    )
 
 
 if __name__ == "__main__":

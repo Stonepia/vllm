@@ -16,39 +16,180 @@ on Intel XPU, instead of the original NVIDIA H100/B200.
 
 Measured with `autotune_effort=quick` (`autotune_budget_seconds=45` where
 supported by the script), each kernel run sequentially and standalone (not
-concurrently), via `benchmarks/kernels/helion/run_all_7.sh`/`run_remaining.sh`.
+concurrently), via `benchmarks/kernels/helion/run_all_9_xpugraph.sh`.
 `HELION_CACHE_DIR` was redirected to a project-local `.helion_cache/` so
 autotuning artifacts persist across sessions. Full logs: `benchmark_logs/`.
 
-| Kernel | Status | vs `torch.compile(native)` | vs `torch.ops._C` / CUTLASS | max rel_err |
-| --- | --- | --- | --- | --- |
-| `scaled_mm` | Enabled | N/A | 0.357x (1 shape only) | 0.0000 |
-| `scaled_mm_blockwise` | Enabled | N/A | 0.537x | ≤0.006 |
-| `dynamic_per_token_scaled_fp8_quant` | Enabled | 1.510x | N/A | 0.0000 |
-| `rms_norm_dynamic_per_token_quant` | Enabled | 11.686x | N/A | 0.0000 |
-| `per_token_group_fp8_quant` | Enabled | 1.192x | N/A | 0.0643 |
-| `rms_norm_per_block_quant` | Enabled (production path works); **benchmark's live autotuning search fails, see below** | N/A | N/A | N/A |
-| `silu_and_mul_dynamic_per_token_quant` | Enabled | 1.828x | N/A | 0.0714 |
-| `silu_and_mul_per_block_quant` | **Disabled** for production dispatch; standalone benchmark works (bypasses the disabled registry entry) | 2.571x | N/A | 0.0004 |
-| `fused_qk_norm_rope` | Enabled (bug fixed) | 8.131x | N/A | 0.0028 |
+Timing uses `torch.xpu.XPUGraph` capture/replay (`bench_utils.py`'s
+`do_bench_xpu_graph`, an XPU port of `triton.testing.do_bench_cudagraph`) to
+match the blog's own dispatch-overhead-free methodology -- see
+[Methodology correction](#methodology-correction-dispatch-overhead-was-inflating-speedups)
+below for why this replaced an earlier, meaningfully wrong set of numbers.
+
+| Kernel | Status | vs `torch.compile(native)` | vs `torch.ops._C` / CUTLASS | max rel_err | XPUGraph |
+| --- | --- | --- | --- | --- | --- |
+| `scaled_mm` | Enabled | N/A | *(36-shape sweep in progress -- see below)* | -- | -- |
+| `scaled_mm_blockwise` | Enabled | N/A | 0.179x | ≤0.006 | Enabled |
+| `dynamic_per_token_scaled_fp8_quant` | Enabled | 1.707x | N/A | 0.0000 | Enabled |
+| `rms_norm_dynamic_per_token_quant` | Enabled | 2.571x | N/A | 0.0000 | Enabled |
+| `per_token_group_fp8_quant` | Enabled | 1.215x | N/A | 0.0714 | Enabled |
+| `rms_norm_per_block_quant` | Enabled (production path works); **benchmark's live autotuning search fails, see below** | N/A | N/A | N/A | N/A (search fails before any timing) |
+| `silu_and_mul_dynamic_per_token_quant` | Enabled | 0.762x | N/A | 0.0714 | Enabled |
+| `silu_and_mul_per_block_quant` | **Disabled** for production dispatch; standalone benchmark works (bypasses the disabled registry entry) | 1.946x | N/A | 0.0082 | Enabled |
+| `fused_qk_norm_rope` | Enabled (bug fixed) | 2.803x | N/A | 0.0027 | Enabled |
 
 `torch.ops._C` is N/A across the board: confirmed unavailable (CUDA-only,
 not registered) for all 7 non-GEMM kernels in this environment. `scaled_mm`/
 `scaled_mm_blockwise` have no `torch.compile` column, matching the blog's own
 Table 2 (CUTLASS-only comparison for GEMM kernels) -- their `torch._scaled_mm`
-comparison is unaffected by anything below.
+comparison is unaffected by the methodology correction below (it always used
+`torch._scaled_mm`, a real op, not a Python/dispatch-heavy `torch.compile`
+wrapper, so it was never subject to the same inflation).
+
+"XPUGraph" reports whether that row's number used graph-capture-based
+timing (eliminating dispatch overhead, matching the blog) or fell back to
+plain `triton.testing.do_bench` (`bench_utils.bench_with_xpu_graph_fallback`
+falls back automatically and transparently rather than silently reporting a
+possibly-inflated number as if it were graph-based).
 
 Per-shape numbers, autotuning wall time, and full stdout for every kernel are
-in `benchmark_logs/bench_<kernel>.log`.
+in `benchmark_logs/bench_<kernel>_xpugraph.log`. See
+[Detailed per-case reports](#detailed-per-case-reports) below for the full
+per-shape breakdown in `case | baseline_ms | kernel_ms | speedup(x)` form.
 
 **Directional comparison with the blog's CUDA results**: on H100/B200,
 `scaled_mm`/`scaled_mm_blockwise` were competitive with or beat CUTLASS
 (0.74-1.08x), while non-GEMM kernels won more modestly (1.13-2.3x vs
-`torch.ops._C`). On this XPU, the two GEMM kernels currently *lose* to the
-native op (0.36-0.54x), while the non-GEMM kernels show much larger apparent
-wins (1.2-11.7x vs `torch.compile`) -- not directly comparable
-magnitude-for-magnitude to the blog's `torch.ops._C` column, since XPU has no
-`torch.ops._C` implementation available to compare against at all here.
+`torch.ops._C`). On this XPU, `scaled_mm_blockwise` loses more heavily to the
+native op (0.18x) than either H100 (1.08x, a different kernel granted) or
+B200 (0.78x) in the blog -- consistent with the blog's own finding that GEMM
+performance depends heavily on Triton codegen quality for the specific
+hardware target, which is evidently still less mature for this XPU than for
+NVIDIA's backends. Non-GEMM kernels range 0.76x-2.8x vs `torch.compile` --
+much more in line with the blog's 1.13x-2.33x range than the pre-correction
+numbers were, though `silu_and_mul_dynamic_per_token_quant` now shows Helion
+*losing* to `torch.compile` at this shape set (0.76x), which the blog's own
+methodology didn't observe for any kernel on H100/B200.
+
+## Methodology correction: dispatch overhead was inflating speedups
+
+An earlier version of this table reported much larger "vs torch.compile"
+speedups for several kernels (e.g. `rms_norm_dynamic_per_token_quant` at
+11.686x, `fused_qk_norm_rope` at 8.131x) that turned out to be substantially
+wrong -- both dropped to roughly 2.5-2.8x once measured correctly (see
+current table above), much closer to the blog's own H100/B200 numbers for
+the same two kernels (1.18-1.24x and 1.13-1.38x respectively).
+
+Root cause: the blog's own methodology states it explicitly --
+*"we enabled CudaGraph mode via `triton.testing.do_bench_cudagraph` ... to
+get rid of noises like dispatch overhead."* `do_bench_cudagraph` is
+hardcoded to `torch.cuda.*` APIs and does not run on XPU, so the original
+benchmark scripts fell back to plain `triton.testing.do_bench`, which
+measures Python/dispatch overhead *alongside* real kernel time. For the
+sub-millisecond kernels here, that overhead is a large fraction of what's
+measured -- and it inflated the `torch.compile` baseline (more per-call
+guard-checking/dispatch overhead than Helion's thinner wrapper) far more
+than the Helion kernel, producing misleadingly large "speedups".
+
+Confirmed directly before fixing anything: capturing the same call into an
+XPU graph (`torch.xpu.XPUGraph` -- confirmed present and working, XPU's
+direct analog of `torch.cuda.CUDAGraph`) and replaying it, for
+`rms_norm_dynamic_per_token_quant` at `hidden_size=4096`, dropped the
+measured `torch.compile` baseline from 0.244ms to 0.059ms (a 4.13x
+difference from dispatch overhead alone), while the Helion kernel's own
+measurement barely moved.
+
+Fix: `benchmarks/kernels/helion/bench_utils.py`'s `do_bench_xpu_graph` is a
+same-algorithm XPU port of `do_bench_cudagraph` (captures `n_repeat` calls
+back-to-back into one graph, sized so total replay is ~20ms, then times
+replays of that graph -- capturing multiple repeats into *one* graph, not
+replaying a single-call graph in a loop, is what actually removes dispatch
+overhead from the measurement). All 9 kernels' benchmark scripts now use it
+via `bench_with_xpu_graph_fallback`, which falls back to plain `do_bench`
+(and reports that fact, not silently) if graph capture fails for a given
+case.
+
+## Detailed per-case reports
+
+Full `case | baseline_ms | kernel_ms | speedup(x)` breakdown per kernel, as
+printed by each `bench_<kernel>.py` (same numbers as the Summary table's
+geomean, just per-shape). Hardware: Intel(R) Arc(TM) Pro B70 Graphics for
+all tables below.
+
+### `dynamic_per_token_scaled_fp8_quant`
+
+Baseline: torch.compile(native_impl)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| hidden_size_2048_num_tokens_128 | 0.005 | 0.004 | 1.234 |
+| hidden_size_4096_num_tokens_128 | 0.006 | 0.003 | 2.219 |
+| hidden_size_5120_num_tokens_128 | 0.008 | 0.004 | 1.817 |
+
+### `rms_norm_dynamic_per_token_quant`
+
+Baseline: torch.compile(native_impl)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| hidden_size_2048_num_tokens_128 | 0.034 | 0.016 | 2.092 |
+| hidden_size_4096_num_tokens_128 | 0.048 | 0.020 | 2.442 |
+| hidden_size_5120_num_tokens_128 | 0.057 | 0.017 | 3.327 |
+
+### `per_token_group_fp8_quant`
+
+Baseline: torch.compile(native_impl)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| hidden_size_2048_group_size_128_num_tokens_128 | 0.013 | 0.044 | 0.300 |
+| hidden_size_4096_group_size_128_num_tokens_128 | 0.015 | 0.004 | 3.803 |
+| hidden_size_5120_group_size_128_num_tokens_128 | 0.007 | 0.004 | 1.575 |
+
+### `silu_and_mul_dynamic_per_token_quant`
+
+Baseline: torch.compile(native_impl)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| intermediate_size_6144_num_tokens_128 | 0.012 | 0.049 | 0.255 |
+| intermediate_size_12288_num_tokens_128 | 0.023 | 0.025 | 0.893 |
+| intermediate_size_25600_num_tokens_128 | 0.048 | 0.025 | 1.946 |
+
+### `silu_and_mul_per_block_quant`
+
+Baseline: torch.compile(native_impl)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| intermediate_size_6144_group_size_128_num_tokens_128 | 0.013 | 0.007 | 1.891 |
+| intermediate_size_12288_group_size_128_num_tokens_128 | 0.021 | 0.011 | 2.019 |
+| intermediate_size_25600_group_size_128_num_tokens_128 | 0.049 | 0.026 | 1.930 |
+
+### `fused_qk_norm_rope`
+
+Baseline: torch.compile(baseline)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| num_q_heads_16_num_kv_heads_8_num_tokens_128 | 0.040 | 0.011 | 3.522 |
+| num_q_heads_32_num_kv_heads_8_num_tokens_128 | 0.055 | 0.018 | 3.069 |
+| num_q_heads_64_num_kv_heads_8_num_tokens_128 | 0.077 | 0.038 | 2.038 |
+
+### `scaled_mm_blockwise`
+
+Baseline: torch._scaled_mm (CUTLASS-equivalent)
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| Qwen3-1.7B_qkv_proj_M_128_K_2048_N_4096 | 0.040 | 0.254 | 0.158 |
+| Qwen3-8B_qkv_proj_M_128_K_4096_N_6144 | 0.139 | 0.899 | 0.154 |
+| Qwen3-32B_qkv_proj_M_128_K_5120_N_10240 | 0.275 | 1.160 | 0.237 |
+
+### `scaled_mm`
+
+*36-shape sweep (12 `[K, N]` shapes x 3 `num_tokens`) in progress -- to be
+added once complete.*
 
 ## Kernel status details
 
@@ -188,29 +329,30 @@ kernels' "final verification" phase (a post-search re-benchmark step,
 proper full sweep later.
 
 The 7-non-GEMM-kernel sequential re-run (`run_all_7.sh`/`run_remaining.sh`,
-results now in the Summary table above) took **~2h7m of actual kernel time**
+superseded by `run_all_9_xpugraph.sh`) took **~2h7m of actual kernel time**
 (sum of all 7 scripts' wall time) across two invocations, plus a lost
 **~12h** to the `rms_norm_per_block_quant` hang described above before it
 was caught -- per-kernel wall time ranged from 12s (that same kernel's
 clean-failure retry) to ~34 min (`dynamic_per_token_scaled_fp8_quant`, its
-first invocation with a cold Triton/Helion cache).
+first invocation with a cold Triton/Helion cache). The subsequent
+`run_all_9_xpugraph.sh` re-run (methodology fix, current Summary table
+numbers) reused `.helion_cache/`'s already-tuned configs and only needed to
+re-measure timing, so 8 of the 9 kernels completed in under 3 minutes total;
+`scaled_mm`'s 36-shape sweep (not previously run in full) is the exception
+-- see below.
 
 ## What's not done (flagging explicitly)
 
+- `scaled_mm`'s full 36-shape sweep (12 `[K, N]` x 3 `num_tokens`) was still
+  running as of this writing (each never-before-seen shape needs fresh
+  autotuning, ~unbounded per the economics above) -- Summary table and
+  Detailed per-case reports above will be updated once it completes.
 - `rms_norm_per_block_quant`'s benchmark: no working speedup number (see its
   subsection above) -- would need either a larger autotune budget/effort
   (untested whether that avoids the specific bad candidate) or an upstream
   Helion fix for the XPU hang-on-error behavior.
-- Only 1 shape benchmarked for `scaled_mm` (vs. 3 for the other kernels) --
-  discovered the 6.5-min/shape cost before settling on the budget-capped
-  approach; not revisited afterward.
 - Real per-shape autotuned configs (vs. the single dummy default per
   kernel) -- see `AUTOTUNING_HANDOFF.md`.
-- Clean, sequential (non-contended) timing re-measurement for `scaled_mm`/
-  `scaled_mm_blockwise` specifically -- those two numbers in the Summary
-  table still predate the sequential re-run (gathered under parallel-subagent
-  GPU contention); the 7 non-GEMM kernels' numbers above are from the clean
-  sequential re-run.
 - End-to-end serving benchmarks (blog Figs. 1-3, Table 3) -- out of scope
   per an earlier explicit scope decision; the Helion kernel registry isn't
   wired into vLLM's real fusion passes/forward pass anywhere (upstream or

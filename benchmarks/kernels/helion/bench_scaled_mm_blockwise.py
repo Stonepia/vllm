@@ -33,13 +33,13 @@ import math
 import time
 
 import torch
+from bench_utils import bench_with_xpu_graph_fallback, print_detailed_report
 
 from vllm.kernels.helion.ops.scaled_mm_blockwise import (
     scaled_mm_blockwise as _wrapper,
 )
 from vllm.kernels.helion.register import create_helion_decorated_kernel
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
 
 FP8 = current_platform.fp8_dtype()
 BF16 = torch.bfloat16
@@ -110,8 +110,8 @@ def make_inputs(
     return a, b, scale_a, scale_b, bias
 
 
-def bench(fn) -> float:
-    return triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
+def bench(fn) -> tuple[float, bool]:
+    return bench_with_xpu_graph_fallback(fn)
 
 
 def rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -140,7 +140,8 @@ def main() -> None:
 
     kernel = build_kernel(AUTOTUNE_EFFORT, AUTOTUNE_BUDGET_SECONDS)
 
-    rows: list[tuple[str, int, int, int, float, float, float, float]] = []
+    rows: list[tuple[str, int, int, int, float, float, float, float, bool]] = []
+    detailed_rows: list[tuple[str, float, float]] = []
     autotune_wall_time = 0.0
     for name, (K, N) in B_SHAPES.items():
         a, b, scale_a, scale_b, bias = make_inputs(NUM_TOKENS, K, N)
@@ -157,17 +158,23 @@ def main() -> None:
         torch.xpu.synchronize()
         err = rel_err(out, ref)
 
-        base_ms = bench(lambda ca=call_args: scaled_mm_bw_native(*ca))
-        kern_ms = bench(lambda ca=call_args: kernel(*ca))
+        base_ms, base_graph = bench(lambda ca=call_args: scaled_mm_bw_native(*ca))
+        kern_ms, kern_graph = bench(lambda ca=call_args: kernel(*ca))
+        xpu_graph_enabled = base_graph and kern_graph
         speedup = base_ms / kern_ms if kern_ms > 0 else 0.0
-        rows.append((name, NUM_TOKENS, K, N, err, base_ms, kern_ms, speedup))
+        case_name = f"{name.replace('/', '_')}_M_{NUM_TOKENS}_K_{K}_N_{N}"
+        detailed_rows.append((case_name, base_ms, kern_ms))
+        rows.append(
+            (name, NUM_TOKENS, K, N, err, base_ms, kern_ms, speedup, xpu_graph_enabled)
+        )
+        xpu_graph_str = "enabled" if xpu_graph_enabled else "disabled (fallback)"
         print(
             f"{name:22s} M={NUM_TOKENS:5d} K={K:6d} N={N:6d}  rel_err={err:.4f}  "
             f"native_ms={base_ms:9.5f}  helion_ms={kern_ms:9.5f}  "
-            f"speedup={speedup:6.3f}x"
+            f"speedup={speedup:6.3f}x  xpu_graph={xpu_graph_str}"
         )
 
-    speedups = [r[-1] for r in rows if r[-1] > 0]
+    speedups = [r[-2] for r in rows if r[-2] > 0]
     if speedups:
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
         print(
@@ -176,8 +183,16 @@ def main() -> None:
         )
     max_err = max((r[4] for r in rows), default=0.0)
     print(f"max rel_err across all shapes: {max_err:.4f}")
+    n_graph_enabled = sum(1 for r in rows if r[-1])
+    print(f"xpu_graph enabled for {n_graph_enabled}/{len(rows)} shapes")
     print(
         f"autotuning wall-clock time for {len(rows)} shapes: {autotune_wall_time:.1f}s"
+    )
+
+    print_detailed_report(
+        hardware=current_platform.get_device_name(),
+        baseline_name="torch._scaled_mm (CUTLASS-equivalent)",
+        rows=detailed_rows,
     )
 
 
