@@ -28,7 +28,7 @@ below for why this replaced an earlier, meaningfully wrong set of numbers.
 
 | Kernel | Status | vs `torch.compile(native)` | vs `torch.ops._C` / CUTLASS | max rel_err | XPUGraph |
 | --- | --- | --- | --- | --- | --- |
-| `scaled_mm` | Enabled | N/A | *(36-shape sweep in progress -- see below)* | -- | -- |
+| `scaled_mm` | Enabled | N/A | 0.115x (33/36 shapes) | 0.0000 | Enabled |
 | `scaled_mm_blockwise` | Enabled | N/A | 0.179x | ≤0.006 | Enabled |
 | `dynamic_per_token_scaled_fp8_quant` | Enabled | 1.707x | N/A | 0.0000 | Enabled |
 | `rms_norm_dynamic_per_token_quant` | Enabled | 2.571x | N/A | 0.0000 | Enabled |
@@ -60,16 +60,23 @@ per-shape breakdown in `case | baseline_ms | kernel_ms | speedup(x)` form.
 **Directional comparison with the blog's CUDA results**: on H100/B200,
 `scaled_mm`/`scaled_mm_blockwise` were competitive with or beat CUTLASS
 (0.74-1.08x), while non-GEMM kernels won more modestly (1.13-2.3x vs
-`torch.ops._C`). On this XPU, `scaled_mm_blockwise` loses more heavily to the
-native op (0.18x) than either H100 (1.08x, a different kernel granted) or
-B200 (0.78x) in the blog -- consistent with the blog's own finding that GEMM
-performance depends heavily on Triton codegen quality for the specific
-hardware target, which is evidently still less mature for this XPU than for
-NVIDIA's backends. Non-GEMM kernels range 0.76x-2.8x vs `torch.compile` --
-much more in line with the blog's 1.13x-2.33x range than the pre-correction
-numbers were, though `silu_and_mul_dynamic_per_token_quant` now shows Helion
-*losing* to `torch.compile` at this shape set (0.76x), which the blog's own
-methodology didn't observe for any kernel on H100/B200.
+`torch.ops._C`). On this XPU, both GEMM kernels lose far more heavily to the
+native op than either H100 or B200 did in the blog: `scaled_mm_blockwise` at
+0.18x (vs. 1.08x/0.78x) and `scaled_mm` at 0.115x geomean across 33/36 shapes
+(vs. blog values not directly given per-kernel, but never below 0.74x for
+either GEMM kernel on either blog GPU) -- consistent in *direction* with the
+blog's own finding that GEMM performance depends heavily on Triton codegen
+quality for the specific hardware target, but a substantially larger gap
+than the blog observed on either NVIDIA GPU, suggesting Triton GEMM codegen
+is markedly less mature for this XPU target than for either H100 or B200.
+`scaled_mm` shows a consistent pattern across shapes -- worse at larger
+`num_tokens` (M): ~0.3-0.4x at M=16 degrading to ~0.05-0.09x at M=1024 across
+all 12 `[K,N]` shapes -- not random noise, so not attributed to
+under-converged autotuning. Non-GEMM kernels range 0.76x-2.8x vs
+`torch.compile` -- much more in line with the blog's 1.13x-2.33x range than
+the pre-correction numbers were, though `silu_and_mul_dynamic_per_token_quant`
+now shows Helion *losing* to `torch.compile` at this shape set (0.76x), which
+the blog's own methodology didn't observe for any kernel on H100/B200.
 
 ## Methodology correction: dispatch overhead was inflating speedups
 
@@ -214,8 +221,48 @@ Baseline: torch._scaled_mm (CUTLASS-equivalent)
 
 ### `scaled_mm`
 
-*36-shape sweep (12 `[K, N]` shapes x 3 `num_tokens`) in progress -- to be
-added once complete.*
+Baseline: torch._scaled_mm (CUTLASS-equivalent)
+
+33/36 shapes completed before hitting the 1-hour per-kernel timeout
+(mid-autotuning on shape 34, `Qwen3-32B/down_proj`) -- the 3 missing
+shapes (`down_proj` at M=16/128/1024) are not in the table below.
+geomean speedup across the 33 completed shapes: **0.115x**.
+
+| case | baseline_ms | kernel_ms | speedup(x) |
+| --- | --- | --- | --- |
+| Qwen3-1.7B_qkv_proj_M_16_K_2048_N_4096 | 0.027 | 0.085 | 0.324 |
+| Qwen3-1.7B_qkv_proj_M_128_K_2048_N_4096 | 0.033 | 0.561 | 0.059 |
+| Qwen3-1.7B_qkv_proj_M_1024_K_2048_N_4096 | 0.261 | 4.466 | 0.058 |
+| Qwen3-1.7B_out_proj_M_16_K_2048_N_2048 | 0.017 | 0.078 | 0.217 |
+| Qwen3-1.7B_out_proj_M_128_K_2048_N_2048 | 0.020 | 0.353 | 0.056 |
+| Qwen3-1.7B_out_proj_M_1024_K_2048_N_2048 | 0.129 | 2.841 | 0.046 |
+| Qwen3-1.7B_gate_up_M_16_K_2048_N_12288 | 0.059 | 0.169 | 0.346 |
+| Qwen3-1.7B_gate_up_M_128_K_2048_N_12288 | 0.106 | 1.292 | 0.082 |
+| Qwen3-1.7B_gate_up_M_1024_K_2048_N_12288 | 0.838 | 10.319 | 0.081 |
+| Qwen3-1.7B_down_proj_M_16_K_6144_N_2048 | 0.044 | 0.137 | 0.318 |
+| Qwen3-1.7B_down_proj_M_128_K_6144_N_2048 | 0.058 | 1.134 | 0.051 |
+| Qwen3-1.7B_down_proj_M_1024_K_6144_N_2048 | 0.371 | 8.404 | 0.044 |
+| Qwen3-8B_qkv_proj_M_16_K_4096_N_6144 | 0.057 | 0.198 | 0.287 |
+| Qwen3-8B_qkv_proj_M_128_K_4096_N_6144 | 0.117 | 1.413 | 0.083 |
+| Qwen3-8B_qkv_proj_M_1024_K_4096_N_6144 | 0.776 | 11.453 | 0.068 |
+| Qwen3-8B_out_proj_M_16_K_4096_N_4096 | 0.051 | 0.142 | 0.360 |
+| Qwen3-8B_out_proj_M_128_K_4096_N_4096 | 0.063 | 0.994 | 0.063 |
+| Qwen3-8B_out_proj_M_1024_K_4096_N_4096 | 0.508 | 7.677 | 0.066 |
+| Qwen3-8B_gate_up_M_16_K_4096_N_24576 | 0.202 | 0.622 | 0.325 |
+| Qwen3-8B_gate_up_M_128_K_4096_N_24576 | 0.407 | 4.584 | 0.089 |
+| Qwen3-8B_gate_up_M_1024_K_4096_N_24576 | 3.148 | 35.659 | 0.088 |
+| Qwen3-8B_down_proj_M_16_K_12288_N_4096 | 0.153 | 0.404 | 0.379 |
+| Qwen3-8B_down_proj_M_128_K_12288_N_4096 | 0.191 | 3.192 | 0.060 |
+| Qwen3-8B_down_proj_M_1024_K_12288_N_4096 | 1.491 | 25.560 | 0.058 |
+| Qwen3-32B_qkv_proj_M_16_K_5120_N_10240 | 0.144 | 0.345 | 0.417 |
+| Qwen3-32B_qkv_proj_M_128_K_5120_N_10240 | 0.233 | 2.675 | 0.087 |
+| Qwen3-32B_qkv_proj_M_1024_K_5120_N_10240 | 1.606 | 21.485 | 0.075 |
+| Qwen3-32B_out_proj_M_16_K_5120_N_5120 | 0.067 | 0.241 | 0.280 |
+| Qwen3-32B_out_proj_M_128_K_5120_N_5120 | 0.140 | 1.466 | 0.095 |
+| Qwen3-32B_out_proj_M_1024_K_5120_N_5120 | 0.796 | 11.922 | 0.067 |
+| Qwen3-32B_gate_up_M_16_K_5120_N_51200 | 0.571 | 1.637 | 0.349 |
+| Qwen3-32B_gate_up_M_128_K_5120_N_51200 | 1.094 | 12.715 | 0.086 |
+| Qwen3-32B_gate_up_M_1024_K_5120_N_51200 | 8.094 | 92.585 | 0.087 |
 
 ## Kernel status details
 
@@ -363,16 +410,19 @@ clean-failure retry) to ~34 min (`dynamic_per_token_scaled_fp8_quant`, its
 first invocation with a cold Triton/Helion cache). The subsequent
 `run_all_9_xpugraph.sh` re-run (methodology fix, current Summary table
 numbers) reused `.helion_cache/`'s already-tuned configs and only needed to
-re-measure timing, so 8 of the 9 kernels completed in under 3 minutes total;
-`scaled_mm`'s 36-shape sweep (not previously run in full) is the exception
--- see below.
+re-measure timing, so 8 of the 9 kernels completed in under 3 minutes total.
+`scaled_mm`'s 36-shape sweep is the exception: every shape needed fresh
+autotuning (this exact 36-shape x quick-effort combination hadn't been run
+to completion before), and it hit a 1-hour per-kernel timeout at 33/36
+shapes (each shape averaging ~1.8 min, consistent with the per-shape
+economics above, though not every shape converges at the same rate).
 
 ## What's not done (flagging explicitly)
 
-- `scaled_mm`'s full 36-shape sweep (12 `[K, N]` x 3 `num_tokens`) was still
-  running as of this writing (each never-before-seen shape needs fresh
-  autotuning, ~unbounded per the economics above) -- Summary table and
-  Detailed per-case reports above will be updated once it completes.
+- `scaled_mm`'s full 36-shape sweep: 33/36 completed (see its Detailed
+  per-case report above); the last 3 (`Qwen3-32B/down_proj` at
+  M=16/128/1024) were cut off by the 1-hour timeout. Re-running just those
+  3 shapes (or raising the timeout) would complete the grid.
 - `rms_norm_per_block_quant`'s benchmark: no working speedup number (see its
   subsection above) -- would need either a larger autotune budget/effort
   (untested whether that avoids the specific bad candidate) or an upstream
