@@ -45,6 +45,10 @@ _GPU_NAME_ALIASES: dict[str, str] = {
     "tesla_v100_pcie_16gb": "tesla_v100",
     # AMD ROCm variants (from _ROCM_DEVICE_ID_NAME_MAP in rocm.py)
     "amd_instinct_mi300x_hf": "amd_instinct_mi300x",
+    # Intel XPU variants. torch.xpu.get_device_name() includes "(R)"/"(TM)"
+    # trademark markers that the [\s/-]+ regex above does not strip, so these
+    # need an explicit alias rather than normalizing cleanly on their own.
+    "intel(r)_arc(tm)_pro_b70_graphics": "intel_arc_pro_b70",
     # ADD MORE HERE
 }
 

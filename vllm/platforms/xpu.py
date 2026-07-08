@@ -7,13 +7,27 @@ from typing import TYPE_CHECKING
 
 import torch
 
-# import custom ops, trigger op registration
-import vllm_xpu_kernels._C  # noqa
-import vllm_xpu_kernels._moe_C  # noqa
-import vllm_xpu_kernels._xpu_C  # noqa
-
 import vllm.envs as envs
 from vllm.logger import init_logger
+
+# import custom ops, trigger op registration.
+# These prebuilt XPU kernels are optional: if the installed
+# ``vllm_xpu_kernels`` package's ABI does not match the active oneAPI/torch-XPU
+# runtime (e.g. it was built against libsycl.so.8 while the environment ships
+# libsycl.so.9), a hard top-level import would raise ImportError and silently
+# disable XPU platform detection entirely. Guard it so the platform still loads;
+# code paths that require these custom ops will fail explicitly when used.
+try:
+    import vllm_xpu_kernels._C  # noqa
+    import vllm_xpu_kernels._moe_C  # noqa
+    import vllm_xpu_kernels._xpu_C  # noqa
+except ImportError as e:
+    init_logger(__name__).warning(
+        "Failed to import vllm_xpu_kernels custom ops: %s. XPU platform will "
+        "load without prebuilt custom kernels.",
+        e,
+    )
+
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
