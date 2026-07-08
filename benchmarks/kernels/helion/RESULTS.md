@@ -109,6 +109,32 @@ via `bench_with_xpu_graph_fallback`, which falls back to plain `do_bench`
 (and reports that fact, not silently) if graph capture fails for a given
 case.
 
+### Residual gap vs. the blog's H100/B200 numbers: real, not a measurement artifact
+
+Even after the fix, `rms_norm_dynamic_per_token_quant` (2.571x) and
+`fused_qk_norm_rope` (2.803x) are still noticeably higher than the blog's own
+H100/B200 numbers for the same two kernels (1.18-1.24x, 1.13-1.38x). This
+gap is real, not leftover measurement error -- confirmed via
+`torch.profiler` at one shape each (Qwen3-8B):
+
+| Kernel | compiled(native) kernel launches | Helion kernel launches |
+| --- | --- | --- |
+| `fused_qk_norm_rope` | 19 (17 separate ATen ops -- pow/rsqrt/mul/add/reduce/copy -- plus only 2 genuinely-fused `triton_poi_fused_*` kernels) | 2 (1 fused kernel + 1 D2D memcpy) |
+| `rms_norm_dynamic_per_token_quant` | 20 | 4 |
+
+`torch.compile`'s Inductor backend is fusing far less aggressively on this
+XPU build than it does on CUDA (where the blog's own `combo_kernels: True`
+config is specifically meant to encourage exactly this kind of fusion).
+Each of those extra kernel launches has real GPU-side launch/synchronization
+overhead that XPU-graph capture does *not* eliminate (graph capture removes
+CPU-side Python dispatch overhead; it does not turn 19 kernel launches into
+1). Helion achieving true single-kernel fusion here is a genuine advantage
+on this hardware/software stack, not an artifact -- it's just a *larger*
+advantage here than on H100/B200, because XPU's Inductor fusion has more
+ground to make up. Not a discrepancy to chase further within this task's
+scope; documented here so the numbers aren't mistaken for another
+measurement bug.
+
 ## Detailed per-case reports
 
 Full `case | baseline_ms | kernel_ms | speedup(x)` breakdown per kernel, as
