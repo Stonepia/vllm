@@ -28,7 +28,7 @@ below for why this replaced an earlier, meaningfully wrong set of numbers.
 
 | Kernel | Status | vs `torch.compile(native)` | vs `torch.ops._C` / CUTLASS | max rel_err | XPUGraph |
 | --- | --- | --- | --- | --- | --- |
-| `scaled_mm` | Enabled | N/A | 0.115x (33/36 shapes) | 0.0000 | Enabled |
+| `scaled_mm` | Enabled | N/A | 0.119x (34/36 shapes) | 0.0000 | Enabled |
 | `scaled_mm_blockwise` | Enabled | N/A | 0.179x | ≤0.006 | Enabled |
 | `dynamic_per_token_scaled_fp8_quant` | Enabled | 1.707x | N/A | 0.0000 | Enabled |
 | `rms_norm_dynamic_per_token_quant` | Enabled | 2.571x | N/A | 0.0000 | Enabled |
@@ -62,7 +62,7 @@ per-shape breakdown in `case | baseline_ms | kernel_ms | speedup(x)` form.
 (0.74-1.08x), while non-GEMM kernels won more modestly (1.13-2.3x vs
 `torch.ops._C`). On this XPU, both GEMM kernels lose far more heavily to the
 native op than either H100 or B200 did in the blog: `scaled_mm_blockwise` at
-0.18x (vs. 1.08x/0.78x) and `scaled_mm` at 0.115x geomean across 33/36 shapes
+0.18x (vs. 1.08x/0.78x) and `scaled_mm` at 0.119x geomean across 34/36 shapes
 (vs. blog values not directly given per-kernel, but never below 0.74x for
 either GEMM kernel on either blog GPU) -- consistent in *direction* with the
 blog's own finding that GEMM performance depends heavily on Triton codegen
@@ -72,7 +72,11 @@ is markedly less mature for this XPU target than for either H100 or B200.
 `scaled_mm` shows a consistent pattern across shapes -- worse at larger
 `num_tokens` (M): ~0.3-0.4x at M=16 degrading to ~0.05-0.09x at M=1024 across
 all 12 `[K,N]` shapes -- not random noise, so not attributed to
-under-converged autotuning. Non-GEMM kernels range 0.76x-2.8x vs
+under-converged autotuning. The largest `[K,N]` shape in the grid
+(`Qwen3-32B/down_proj`, K=25600) is missing its M=128/M=1024 points entirely
+(see [What's not done](#whats-not-done-flagging-explicitly)): benchmarking
+the baseline op itself at that size runs the XPU out of memory. Non-GEMM
+kernels range 0.76x-2.8x vs
 `torch.compile` -- much more in line with the blog's 1.13x-2.33x range than
 the pre-correction numbers were, though `silu_and_mul_dynamic_per_token_quant`
 now shows Helion *losing* to `torch.compile` at this shape set (0.76x), which
@@ -223,10 +227,12 @@ Baseline: torch._scaled_mm (CUTLASS-equivalent)
 
 Baseline: torch._scaled_mm (CUTLASS-equivalent)
 
-33/36 shapes completed before hitting the 1-hour per-kernel timeout
-(mid-autotuning on shape 34, `Qwen3-32B/down_proj`) -- the 3 missing
-shapes (`down_proj` at M=16/128/1024) are not in the table below.
-geomean speedup across the 33 completed shapes: **0.115x**.
+34/36 shapes completed; the remaining 2 (`Qwen3-32B/down_proj` at
+M=128/1024) are excluded because benchmarking them runs the XPU out of
+memory -- see
+[Detailed per-case reports](#detailed-per-case-reports) and
+[What's not done](#whats-not-done-flagging-explicitly) for specifics.
+geomean speedup across the 34 completed shapes: **0.119x**.
 
 | case | baseline_ms | kernel_ms | speedup(x) |
 | --- | --- | --- | --- |
@@ -263,6 +269,7 @@ geomean speedup across the 33 completed shapes: **0.115x**.
 | Qwen3-32B_gate_up_M_16_K_5120_N_51200 | 0.571 | 1.637 | 0.349 |
 | Qwen3-32B_gate_up_M_128_K_5120_N_51200 | 1.094 | 12.715 | 0.086 |
 | Qwen3-32B_gate_up_M_1024_K_5120_N_51200 | 8.094 | 92.585 | 0.087 |
+| Qwen3-32B_down_proj_M_16_K_25600_N_5120 | 0.354 | 1.129 | 0.313 |
 
 ## Kernel status details
 
@@ -408,21 +415,47 @@ superseded by `run_all_9_xpugraph.sh`) took **~2h7m of actual kernel time**
 was caught -- per-kernel wall time ranged from 12s (that same kernel's
 clean-failure retry) to ~34 min (`dynamic_per_token_scaled_fp8_quant`, its
 first invocation with a cold Triton/Helion cache). The subsequent
-`run_all_9_xpugraph.sh` re-run (methodology fix, current Summary table
-numbers) reused `.helion_cache/`'s already-tuned configs and only needed to
-re-measure timing, so 8 of the 9 kernels completed in under 3 minutes total.
-`scaled_mm`'s 36-shape sweep is the exception: every shape needed fresh
-autotuning (this exact 36-shape x quick-effort combination hadn't been run
-to completion before), and it hit a 1-hour per-kernel timeout at 33/36
-shapes (each shape averaging ~1.8 min, consistent with the per-shape
-economics above, though not every shape converges at the same rate).
+`run_all_9_xpugraph.sh` re-run (methodology fix) reused `.helion_cache/`'s
+already-tuned configs and only needed to re-measure timing, so 8 of the 9
+kernels completed in under 3 minutes total. `scaled_mm`'s 36-shape sweep
+needed two further attempts: the first hit a 1-hour per-kernel timeout at
+33/36 shapes (each shape averaging ~1.8 min to autotune from a cold cache);
+raising `PER_KERNEL_TIMEOUT` to 12h and re-running let the 33 already-cached
+shapes replay in seconds and the 34th (`Qwen3-32B/down_proj` at M=16, never
+autotuned before) complete in ~352s, but then crashed the whole process
+(`rc=1`, not a timeout) on the very next shape -- see
+[What's not done](#whats-not-done-flagging-explicitly) for why.
+Current Summary table numbers reflect this second, more complete run.
 
 ## What's not done (flagging explicitly)
 
-- `scaled_mm`'s full 36-shape sweep: 33/36 completed (see its Detailed
-  per-case report above); the last 3 (`Qwen3-32B/down_proj` at
-  M=16/128/1024) were cut off by the 1-hour timeout. Re-running just those
-  3 shapes (or raising the timeout) would complete the grid.
+- `scaled_mm`'s full 36-shape sweep: 34/36 completed (see its Detailed
+  per-case report above). The remaining 2 (`Qwen3-32B/down_proj`, the
+  largest `[K, N]` shape in the grid at K=25600, N=5120, at M=128/1024)
+  are not a timeout or correctness issue -- benchmarking the baseline op
+  (`torch._scaled_mm`) itself at that size raises `RuntimeError:
+  level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)`
+  partway through `do_bench_xpu_graph`'s graph replay, and the
+  fallback-to-plain-`do_bench` path that's supposed to catch this then
+  also fails with `UR_RESULT_ERROR_OUT_OF_RESOURCES` since the XPU
+  context is already wedged by that point. Reproduced deterministically
+  in isolation (not a one-off flake): `do_bench_xpu_graph` estimates how
+  many repeats of a call to capture into one graph from a target replay
+  duration (`rep=100ms` by default) without capping that count, and for
+  a GEMM this large, capturing enough repeats to fill 100ms of replay
+  time captures enough distinct output-tensor allocations (each call
+  allocates a fresh output) to exhaust XPU memory. The M=16 case for this
+  same shape completed fine (0.313x, in the table above; a smaller output
+  tensor and shorter per-call time means fewer repeats fit the same
+  target replay duration budget, but ~8x/64x more M for the same K, N
+  pushes the captured repeat count and/or per-call size over the edge).
+  Confirmed the XPU device itself recovers fine for a fresh process
+  after this (not a permanent device wedge); the crashed run's process
+  had already exited on its own (`rc=1`) by the time this was found.
+  Not investigated further as instructed -- recorded here as a known
+  methodology limitation for this specific oversized shape rather than
+  fixed (e.g. by capping `n_repeat` or its captured-memory footprint in
+  `bench_utils.py`).
 - `rms_norm_per_block_quant`'s benchmark: no working speedup number (see its
   subsection above) -- would need either a larger autotune budget/effort
   (untested whether that avoids the specific bad candidate) or an upstream

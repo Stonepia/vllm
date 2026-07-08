@@ -10,6 +10,17 @@
 # HELION_AUTOTUNE_IGNORE_ERRORS=1 + a per-kernel timeout are kept from the
 # previous run's incident (rms_norm_per_block_quant's autotuner hanging
 # instead of raising on an XPU Triton gap -- see RESULTS.md).
+#
+# PER_KERNEL_TIMEOUT was 3600 (1h) in the previous run, which cut off
+# scaled_mm at 33/36 shapes mid-autotuning on Qwen3-32B/down_proj (K=25600,
+# the largest K in the whole grid, never previously autotuned) -- raised to
+# 12h so a from-scratch autotune of that shape has enough room. This does
+# not slow down the other 8 kernels: their configs are already cached in
+# .helion_cache/, so they still finish in seconds regardless of the ceiling.
+# Note: this timeout bump got scaled_mm's M=16 case for that shape done
+# (34/36 total), but M=128/1024 for the same shape hit a separate,
+# non-timeout XPU out-of-memory crash (RESULTS.md's "What's not done") --
+# raising this further will not fix that.
 set -uo pipefail
 
 cd /home/tongsu/vllm
@@ -18,7 +29,7 @@ source ~/torch-xpu-env/.venv/bin/activate
 export HELION_CACHE_DIR=/home/tongsu/vllm/.helion_cache
 export HELION_AUTOTUNE_IGNORE_ERRORS=1
 LOGDIR=/home/tongsu/vllm/benchmark_logs
-PER_KERNEL_TIMEOUT=3600
+PER_KERNEL_TIMEOUT=43200
 
 KERNELS=(
   rms_norm_dynamic_per_token_quant
