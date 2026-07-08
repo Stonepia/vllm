@@ -36,9 +36,10 @@ def generate_inputs() -> dict[CaseKey, tuple[Any, ...]]:
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = current_platform.fp8_dtype()
     scale_dtype: torch.dtype = torch.float32
+    device = current_platform.device_type
     inputs = {}
     for num_tokens, hidden_size in product(num_tokens_list, hidden_size_list):
-        input = torch.randn(num_tokens, hidden_size, device="cuda", dtype=in_dtype)
+        input = torch.randn(num_tokens, hidden_size, device=device, dtype=in_dtype)
         result = torch.empty(input.shape, device=input.device, dtype=out_dtype)
         scale = torch.empty((num_tokens, 1), device=input.device, dtype=scale_dtype)
         scale_ub = torch.mean(input).to(scale_dtype)

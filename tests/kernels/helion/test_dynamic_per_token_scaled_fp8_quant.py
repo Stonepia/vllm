@@ -21,6 +21,8 @@ from vllm.kernels.helion.ops.dynamic_per_token_scaled_fp8_quant import (
     dynamic_per_token_scaled_fp8_quant,
     pick_config,
 )
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_helion
 from vllm.utils.torch_utils import set_random_seed
@@ -35,7 +37,10 @@ if not has_helion():
 def _generate_fake_input(num_tokens: int, hidden_size: int) -> tuple[Any, ...]:
     with FakeTensorMode():
         input = torch.randn(
-            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+            num_tokens,
+            hidden_size,
+            device=current_platform.device_type,
+            dtype=torch.bfloat16,
         )
         result = torch.empty(
             input.shape, device=input.device, dtype=current_platform.fp8_dtype()
@@ -44,6 +49,36 @@ def _generate_fake_input(num_tokens: int, hidden_size: int) -> tuple[Any, ...]:
         scale_ub = torch.mean(input).to(torch.float32)
         args = (result, input, scale, scale_ub)
         return args
+
+
+def _reference_dynamic_per_token_scaled_fp8_quant(
+    result: torch.Tensor,
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    scale_ub: torch.Tensor | None,
+) -> None:
+    """Device-agnostic reference for dynamic_per_token_scaled_fp8_quant.
+
+    baseline() in vllm/kernels/helion/ops/dynamic_per_token_scaled_fp8_quant.py
+    calls torch.ops._C.dynamic_per_token_scaled_fp8_quant, which is CUDA-only.
+    On platforms without that custom op (e.g. XPU), use QuantFP8's native
+    (plain PyTorch) per-token dynamic quantization path instead: it computes
+    the same per-token absmax -> optional scale_ub clamp -> divide by fp8 max
+    -> clamp to min_scaling_factor -> reciprocal-multiply-and-clamp math as
+    both the CUDA kernel and this kernel's own Helion implementation, and it
+    is also the exact function vLLM's CustomOp dispatch already uses on XPU
+    for this case (QuantFP8.forward_xpu delegates to forward_native for
+    non-group, per-token quantization).
+
+    Requires an active VllmConfig context (QuantFP8 is a CustomOp/nn.Module);
+    callers must use the `default_vllm_config` pytest fixture.
+    """
+    quant_op = QuantFP8(static=False, group_shape=GroupShape.PER_TOKEN)
+    quantized, computed_scale = quant_op.forward_native(
+        input, scale=None, scale_ub=scale_ub
+    )
+    result.copy_(quantized)
+    scale.copy_(computed_scale)
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +141,7 @@ class TestDynamicPerTokenScaledFp8QuantCorrectness:
     @pytest.mark.parametrize("seed", [0])
     def test_dynamic_per_token_fp8_quant(
         self,
+        default_vllm_config,
         num_tokens: int,
         hidden_size: int,
         dtype: torch.dtype,
@@ -114,23 +150,32 @@ class TestDynamicPerTokenScaledFp8QuantCorrectness:
     ) -> None:
         skip_if_platform_unsupported("dynamic_per_token_scaled_fp8_quant")
         set_random_seed(seed)
+        device = current_platform.device_type
 
         x = (
-            torch.rand(num_tokens, hidden_size, dtype=dtype, device="cuda") + 1e-6
+            torch.rand(num_tokens, hidden_size, dtype=dtype, device=device) + 1e-6
         )  # avoid nans
 
         scale_ub = (
-            torch.mean(x).to(dtype=torch.float32, device="cuda")
+            torch.mean(x).to(dtype=torch.float32, device=device)
             if has_scale_ub
             else None
         )
 
-        ref_out = torch.empty(x.shape, device="cuda", dtype=FP8_DTYPE)
-        ref_scales = torch.empty((x.shape[0], 1), device="cuda", dtype=torch.float32)
-        baseline(ref_out, x, ref_scales, scale_ub)
+        ref_out = torch.empty(x.shape, device=device, dtype=FP8_DTYPE)
+        ref_scales = torch.empty((x.shape[0], 1), device=device, dtype=torch.float32)
+        if current_platform.is_cuda():
+            baseline(ref_out, x, ref_scales, scale_ub)
+        else:
+            # baseline() calls torch.ops._C.dynamic_per_token_scaled_fp8_quant,
+            # which is CUDA-only; use the portable QuantFP8-based reference on
+            # other platforms (e.g. XPU).
+            _reference_dynamic_per_token_scaled_fp8_quant(
+                ref_out, x, ref_scales, scale_ub
+            )
 
-        ops_out = torch.empty(x.shape, device="cuda", dtype=FP8_DTYPE)
-        ops_scales = torch.empty((x.shape[0], 1), device="cuda", dtype=torch.float32)
+        ops_out = torch.empty(x.shape, device=device, dtype=FP8_DTYPE)
+        ops_scales = torch.empty((x.shape[0], 1), device=device, dtype=torch.float32)
         dynamic_per_token_scaled_fp8_quant(ops_out, x, ops_scales, scale_ub)
 
         torch.testing.assert_close(ref_scales, ops_scales)
