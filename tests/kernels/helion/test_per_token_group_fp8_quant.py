@@ -24,6 +24,7 @@ from vllm.kernels.helion.ops.per_token_group_fp8_quant import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_helion
 
 if not has_helion():
@@ -38,7 +39,9 @@ def _generate_fake_input(
 ) -> tuple[Any, ...]:
     with FakeTensorMode():
         input = torch.randn(
-            (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
+            (num_tokens, hidden_size),
+            device=current_platform.device_type,
+            dtype=torch.bfloat16,
         )
         output_q = torch.empty(input.shape, device=input.device, dtype=FP8_DTYPE)
         output_s = torch.empty(
@@ -62,6 +65,45 @@ def _generate_fake_input(
             column_major,
         )
         return args
+
+
+def _reference_per_token_group_fp8_quant(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    dummy_is_scale_transposed: bool = False,
+    dummy_is_tma_aligned: bool = False,
+) -> None:
+    """Device-agnostic float32 reference for per_token_group_fp8_quant.
+
+    baseline() in vllm/kernels/helion/ops/per_token_group_fp8_quant.py calls
+    torch.ops._C.per_token_group_fp8_quant, which is CUDA-only. On platforms
+    without that custom op (e.g. XPU), use this plain-math reference instead,
+    mirroring the exact per-group amax/clamp/scale math that both the CUDA
+    op and the Helion kernel implement (see per_token_group_quant.cu and
+    per_token_group_fp8_quant() below). dummy_is_scale_transposed and
+    dummy_is_tma_aligned are unused by the underlying op itself -- they only
+    describe output_s's caller-provided memory layout -- so this function
+    ignores them and simply writes through output_q/output_s in place,
+    respecting whatever strides the caller already set up.
+    """
+    num_tokens, hidden_size = input.shape
+    groups_per_row = hidden_size // group_size
+    x = input.to(torch.float32).view(num_tokens, groups_per_row, group_size)
+
+    y_s = torch.clamp(torch.amax(torch.abs(x), dim=-1), min=eps) / fp8_max
+    if scale_ue8m0:
+        y_s = torch.exp2(torch.ceil(torch.log2(y_s)))
+
+    y_q = torch.clamp(x / y_s.unsqueeze(-1), fp8_min, fp8_max).to(output_q.dtype)
+
+    output_s.copy_(y_s)
+    output_q.copy_(y_q.view(num_tokens, hidden_size))
 
 
 @pytest.fixture(autouse=True)
@@ -154,8 +196,9 @@ class TestPerTokenGroupFp8QuantCorrectness:
         num_tokens, hidden_size = shape
         fp8_min, fp8_max = get_fp8_min_max()
         eps = 1e-10
+        device = current_platform.device_type
         input = (
-            torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+            torch.randn((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
             * 8
         )
         ref_q = torch.empty(input.shape, device=input.device, dtype=FP8_DTYPE)
@@ -186,18 +229,35 @@ class TestPerTokenGroupFp8QuantCorrectness:
 
         ops_s = ref_s.clone()
 
-        baseline(
-            input,
-            ref_q,
-            ref_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0,
-            column_major,
-            tma_aligned,
-        )
+        if current_platform.is_cuda():
+            baseline(
+                input,
+                ref_q,
+                ref_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                column_major,
+                tma_aligned,
+            )
+        else:
+            # baseline() calls torch.ops._C.per_token_group_fp8_quant, which
+            # is CUDA-only; use the portable float32 math reference on other
+            # platforms (e.g. XPU).
+            _reference_per_token_group_fp8_quant(
+                input,
+                ref_q,
+                ref_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                column_major,
+                tma_aligned,
+            )
         per_token_group_fp8_quant(
             input,
             ops_q,
