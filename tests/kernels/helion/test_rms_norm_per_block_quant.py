@@ -14,6 +14,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tests.kernels.helion.utils import skip_if_platform_unsupported
 from tests.kernels.quant_utils import FP8_DTYPE
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.kernels.helion.case_key import CaseKey
 from vllm.kernels.helion.config_manager import ConfigManager
 from vllm.kernels.helion.ops.rms_norm_per_block_quant import (
@@ -22,6 +23,12 @@ from vllm.kernels.helion.ops.rms_norm_per_block_quant import (
     pick_config,
     rms_norm_per_block_quant,
 )
+from vllm.kernels.helion.utils import get_int8_min_max, get_int8_min_scaling_factor
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+)
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_helion
 from vllm.utils.torch_utils import set_random_seed
 
@@ -37,7 +44,9 @@ def _generate_fake_input(
 ) -> tuple[Any, ...]:
     with FakeTensorMode():
         input = torch.randn(
-            (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
+            (num_tokens, hidden_size),
+            device=current_platform.device_type,
+            dtype=torch.bfloat16,
         )
         result = torch.empty(input.shape, device=input.device, dtype=FP8_DTYPE)
         scale = torch.empty(
@@ -67,6 +76,88 @@ def _generate_fake_input(
             False,
         )
         return args
+
+
+def _reference_rms_norm_per_block_quant(
+    result: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float,
+    scale_ub: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    group_size: int,
+    is_scale_transposed: bool,  # dummy, only affects scale's memory layout
+) -> None:
+    """Device-agnostic reference for rms_norm_per_block_quant.
+
+    baseline() in vllm/kernels/helion/ops/rms_norm_per_block_quant.py calls
+    torch.ops._C.rms_norm_per_block_quant, which is CUDA-only. On platforms
+    without it (e.g. XPU), use this portable composition instead:
+
+    1. vLLM's own RMSNorm.forward_native() for the (optionally
+       residual-fused) RMS normalization + weighting. Its native
+       decomposition (vllm/ir/ops/layernorm.py) is bit-for-bit the same
+       math the Helion kernel performs for this step, so it is reused
+       directly rather than reimplemented.
+    2. A hand-written, portable per-group symmetric quantization step
+       (abs-max -> optional scale_ub clamp -> divide by qtype max ->
+       clamp to min scaling factor -> round-or-not -> clamp -> cast),
+       mirroring rms_norm_per_block_quant()'s own math for this step
+       (already plain, portable torch ops, not a CUDA-only call).
+
+       QuantFP8(group_shape=GroupShape(1, group_size)).forward_native()
+       was considered here instead of hand-writing this step, but was
+       rejected after verification: its dynamic group-quant path
+       (_quantize_group_native) hardcodes FP8 output (no int8 support,
+       needed for this kernel's int8 quant_dtype cases) and silently
+       ignores scale_ub for group quantization (verified empirically:
+       passing scale_ub does not change its output at all), so it
+       cannot cover this kernel's full parameter space.
+
+    Mutates result/scale/residual in place, matching baseline()'s
+    calling convention (mutates_args=["result", "scale", "residual"]).
+    """
+    num_tokens, hidden_size = input.shape
+    groups_per_row = hidden_size // group_size
+
+    # RMSNorm/QuantFP8 are CustomOps and read get_current_vllm_config()
+    # at construction time; provide a default one if none is active.
+    with set_current_vllm_config(VllmConfig()):
+        rmsnorm = RMSNorm(hidden_size, epsilon, dtype=input.dtype)
+        rmsnorm.weight.data = weight
+        if residual is not None:
+            normed, new_residual = rmsnorm.forward_native(input, residual)
+            residual.copy_(new_residual)
+        else:
+            normed = rmsnorm.forward_native(input)
+
+    quant_dtype = result.dtype
+    if quant_dtype == torch.int8:
+        qtype_min, qtype_max = get_int8_min_max()
+        min_scaling_factor = get_int8_min_scaling_factor()
+    else:
+        qtype_min, qtype_max = get_fp8_min_max()
+        min_scaling_factor = 1.0 / (float(qtype_max) * 512.0)
+    qtype_max_f = float(qtype_max)
+
+    normed_grouped = normed.view(num_tokens, groups_per_row, group_size)
+    s = torch.amax(torch.abs(normed_grouped), dim=-1).to(torch.float32)
+
+    if scale_ub is not None:
+        s = s.clamp(max=scale_ub.to(torch.float32))
+
+    s = s * (1.0 / qtype_max_f)
+    s = s.clamp(min=min_scaling_factor)
+    scale.copy_(s)
+
+    if quant_dtype == torch.int8:
+        y = (normed_grouped * (1.0 / s.unsqueeze(-1))).round()
+    else:
+        y = normed_grouped / s.unsqueeze(-1)
+
+    y = y.clamp(qtype_min, qtype_max).to(quant_dtype)
+    result.copy_(y.reshape(num_tokens, hidden_size))
 
 
 @pytest.fixture(autouse=True)
@@ -197,13 +288,14 @@ class TestRmsNormPerBlockQuantCorrectness:
             return
 
         scale = 1 / (hidden_size)
-        input = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda") * scale
+        device = current_platform.device_type
+        input = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * scale
         weight = torch.normal(
             mean=1.0, std=1.0, size=(hidden_size,), dtype=dtype, device=input.device
         )
         residual = torch.randn_like(input) * scale if add_residual else None
         scale_ub = (
-            torch.mean(input).to(dtype=torch.float32, device="cuda")
+            torch.mean(input).to(dtype=torch.float32, device=device)
             if has_scale_ub
             else None
         )
@@ -237,17 +329,33 @@ class TestRmsNormPerBlockQuantCorrectness:
 
         ops_scales = ref_scales.clone()
 
-        baseline(
-            ref_out,
-            input,
-            weight,
-            ref_scales,
-            EPS,
-            scale_ub,
-            ref_residual,
-            group_size,
-            is_scale_transposed,
-        )
+        if current_platform.is_cuda():
+            baseline(
+                ref_out,
+                input,
+                weight,
+                ref_scales,
+                EPS,
+                scale_ub,
+                ref_residual,
+                group_size,
+                is_scale_transposed,
+            )
+        else:
+            # baseline() calls torch.ops._C.rms_norm_per_block_quant
+            # (CUDA-only); use the portable reference on other platforms
+            # (e.g. XPU).
+            _reference_rms_norm_per_block_quant(
+                ref_out,
+                input,
+                weight,
+                ref_scales,
+                EPS,
+                scale_ub,
+                ref_residual,
+                group_size,
+                is_scale_transposed,
+            )
         ref_scales = ref_scales.contiguous()
 
         rms_norm_per_block_quant(

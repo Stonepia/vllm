@@ -8,6 +8,7 @@ import torch
 
 from vllm.kernels.helion.case_key import CaseKey
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_helion
 
 if not has_helion():
@@ -27,7 +28,10 @@ logger = init_logger(__name__)
 
 
 def _compute_cos_sin_cache(
-    max_position_embeddings, rotary_dim, device="cuda", dtype=torch.float
+    max_position_embeddings,
+    rotary_dim,
+    device=current_platform.device_type,
+    dtype=torch.float,
 ):
     inv_freq = 1.0 / (
         10000
@@ -58,7 +62,7 @@ def generate_inputs() -> dict[CaseKey, tuple[Any, ...]]:
     rotary_ratio = 1.0
     is_neox = True
     eps = 1e-6
-    device = "cuda"
+    device = current_platform.device_type
     inputs = {}
 
     for num_tokens, (num_q_heads, num_kv_heads) in product(
@@ -76,7 +80,7 @@ def generate_inputs() -> dict[CaseKey, tuple[Any, ...]]:
             0.8, 1.2
         )
         rotary_dim = int(head_dim * rotary_ratio)
-        cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim)
+        cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim, device=device)
         cos_sin_cache = cos_sin_cache.to(in_dtype)
 
         config_key = CaseKey(
@@ -306,8 +310,9 @@ def fused_qk_norm_rope(
             x1_offset = hl.arange(embed_dim) * 2
             x2_offset = x1_offset + 1
 
-        x1_blk = qkv[tile_m, tile_gn, x1_offset]
-        x2_blk = qkv[tile_m, tile_gn, x2_offset]
+        gather_shape = [x_blk.shape[0], x_blk.shape[1], embed_dim]
+        x1_blk = torch.gather(x_blk, -1, x1_offset[None, None, :].expand(gather_shape))
+        x2_blk = torch.gather(x_blk, -1, x2_offset[None, None, :].expand(gather_shape))
 
         o1_blk = x1_blk * cos_blk[:, None, :] - x2_blk * sin_blk[:, None, :]
         o2_blk = x2_blk * cos_blk[:, None, :] + x1_blk * sin_blk[:, None, :]
