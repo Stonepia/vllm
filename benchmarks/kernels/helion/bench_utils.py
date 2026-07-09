@@ -25,7 +25,12 @@ dispatch-overhead-free measurement the blog's methodology intends.
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -167,3 +172,120 @@ def print_detailed_report(
             f"{name:<{name_width}}| {baseline_ms:<11.3f} | {kernel_ms:<9.3f} | "
             f"{speedup:.3f}"
         )
+
+
+CASE_LINE_PREFIX = "CASE:"
+
+
+def print_case_name(case_name: str) -> None:
+    """Prints one ``--list-cases`` line, tagged with a unique, unambiguous
+    prefix (``run_full_sweep.sh`` greps for it and strips it).
+
+    vLLM's own logging (import-time WARNING/INFO messages from
+    registering all 9 Helion kernels) goes to stdout, not stderr, in this
+    environment -- confirmed directly: a plain ``print(case_name)`` here
+    got ~30 log lines mixed into ``run_full_sweep.sh``'s ``$(...)``
+    capture of ``--list-cases``'s output, corrupting the case count and,
+    worse, silently turning one of those log lines into a bogus
+    "--only-case <warning text>" argument on the next invocation. Only
+    excluding known noise patterns (e.g. lines starting with "WARNING"/
+    "INFO") would be fragile against whatever other noise shows up next;
+    positively tagging the lines we actually want is robust regardless.
+    """
+    print(f"{CASE_LINE_PREFIX}{case_name}")
+
+
+def append_sweep_result(path: str, case: str, **fields: Any) -> None:
+    """Append one case's result to a JSON-lines crash-safe sweep file.
+
+    Used by a script's ``--only-case`` mode to durably persist a result the
+    instant it's computed. flush()+fsync() so the write survives even if
+    the process is killed immediately after (e.g. a subsequent case in the
+    same ``run_full_sweep.sh`` loop iteration crashes -- this write is for
+    an already-completed case, not the crashing one, but the same
+    durability guarantee applies uniformly).
+
+    Each line is a JSON object: ``{"case": ..., "status": "ok", **fields}``.
+    ``run_full_sweep.sh`` appends its own ``{"case": ..., "status":
+    "failed", "rc": ...}`` line directly (via jq/printf, not this function)
+    when a case's subprocess exits non-zero -- deliberately *not* relying
+    on the crashed process to have recorded anything about its own
+    failure, since a hard crash (segfault, driver abort) or a
+    timeout-killed hang leaves no Python code running to do that. See
+    ``SHAPE_AUDIT.md`` / RESULTS.md for why this split (durable
+    self-reporting on success, external observation on failure) is the
+    design, not an oversight.
+    """
+    rec = {"case": case, "status": "ok", **fields}
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def load_sweep_results(path: str) -> dict[str, dict[str, Any]]:
+    """Load a JSON-lines crash-safe sweep file into ``{case: record}``.
+
+    Tolerant of a missing file (returns ``{}``) and of unparsable lines
+    (skipped -- e.g. a line torn by a hard kill mid-write; vanishingly
+    unlikely for a single short ``write()`` syscall followed by fsync, but
+    cheap to guard against). If a case appears more than once (shouldn't
+    happen in normal operation, but e.g. a manually-edited file), the last
+    occurrence wins.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    p = Path(path)
+    if not p.exists():
+        return results
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        results[rec["case"]] = rec
+    return results
+
+
+def add_crash_safe_args(parser: argparse.ArgumentParser) -> None:
+    """Adds the 4 crash-safe-sweep CLI args shared identically by all 9
+    kernels' bench scripts, so ``run_full_sweep.sh`` can drive any of them
+    the same way. See ``bench_scaled_mm.py`` for the reference
+    implementation of how a script wires these up in its own ``main()``:
+    ``--list-cases`` and ``--report-from-sweep`` return immediately;
+    ``--only-case`` measures one case and appends to ``--sweep-file``,
+    letting any exception propagate uncaught (a fresh subprocess, not this
+    one, measures the next case -- see run_full_sweep.sh and RESULTS.md's
+    "What's not done" for why).
+    """
+    parser.add_argument(
+        "--list-cases",
+        action="store_true",
+        help="Print every case name (one per line) and exit. No XPU use, "
+        "no measurement -- for a driver script to enumerate what to run.",
+    )
+    parser.add_argument(
+        "--only-case",
+        default=None,
+        help="Measure just this one case (see --list-cases for names); "
+        "appends its result to --sweep-file and exits. Requires "
+        "--sweep-file. For use by run_full_sweep.sh's crash-safe "
+        "per-case driver -- a case that OOMs/crashes only takes down "
+        "this one invocation, not the rest of the sweep.",
+    )
+    parser.add_argument(
+        "--sweep-file",
+        default=None,
+        help="JSON-lines file --only-case appends its result to, or "
+        "--report-from-sweep reads a completed sweep from.",
+    )
+    parser.add_argument(
+        "--report-from-sweep",
+        default=None,
+        metavar="SWEEP_FILE",
+        help="Print the aggregate report (geomean + detailed table) from "
+        "an already-completed --sweep-file, instead of measuring "
+        "anything.",
+    )

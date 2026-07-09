@@ -27,8 +27,9 @@ reproduce this kernel's own ``generate_inputs()`` ``num_heads_pair`` list
 against the Qwen3 qkv_proj ``[K, N]`` dims already used in
 ``bench_scaled_mm.py``: ``N = (num_q_heads + 2 * num_kv_heads) * head_dim``
 with ``head_dim=128`` gives N=4096/6144/10240 for Qwen3-1.7B/8B/32B,
-matching exactly. ``num_tokens=128`` is used for all three shapes (a
-representative single value, not a full grid).
+matching exactly. ``num_tokens=128`` is used by default (a representative
+single value); ``--full`` sweeps the blog's full 14-value num_tokens grid
+(1..8192) per SHAPE_AUDIT.md.
 
 ** FIXED data race on Intel XPU (see fused_qk_norm_rope.py) **: this
 kernel used to exhibit a data race on Intel XPU (repeated invocations
@@ -47,15 +48,30 @@ Usage:
     python benchmarks/kernels/helion/bench_fused_qk_norm_rope.py
     python benchmarks/kernels/helion/bench_fused_qk_norm_rope.py \
         --autotune-effort full --autotune-budget-seconds 120
+
+Crash-safe full-sweep mode (see ``run_full_sweep.sh``):
+    python bench_fused_qk_norm_rope.py --full --list-cases
+    python bench_fused_qk_norm_rope.py --full \\
+        --only-case <name> --sweep-file benchmark_logs/sweep_....jsonl
+    python bench_fused_qk_norm_rope.py --full \\
+        --report-from-sweep benchmark_logs/sweep_....jsonl
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+from collections.abc import Iterator
 
 import torch
-from bench_utils import bench_with_xpu_graph_fallback, print_detailed_report
+from bench_utils import (
+    add_crash_safe_args,
+    append_sweep_result,
+    bench_with_xpu_graph_fallback,
+    load_sweep_results,
+    print_case_name,
+    print_detailed_report,
+)
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.kernels.helion.ops.fused_qk_norm_rope import (
@@ -71,7 +87,8 @@ from vllm.platforms import current_platform
 BF16 = torch.bfloat16
 DEVICE = current_platform.device_type
 HEAD_DIM = 128
-NUM_TOKENS = 128
+NUM_TOKENS_FULL = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+NUM_TOKENS_QUICK = [128]
 EPS = 1e-6
 IS_NEOX = True
 
@@ -120,7 +137,7 @@ def _probe_torch_ops_c() -> bool:
     if not hasattr(torch.ops._C, "fused_qk_norm_rope"):
         return False
     try:
-        qkv, rest = make_inputs(16, 8)
+        qkv, rest = make_inputs(16, 8, 128)
         torch_ops_c_baseline(qkv, *rest)
         torch.xpu.synchronize()
         return True
@@ -128,12 +145,14 @@ def _probe_torch_ops_c() -> bool:
         return False
 
 
-def make_inputs(num_q_heads: int, num_kv_heads: int) -> tuple[torch.Tensor, tuple]:
+def make_inputs(
+    num_q_heads: int, num_kv_heads: int, num_tokens: int
+) -> tuple[torch.Tensor, tuple]:
     total_dim = (num_q_heads + 2 * num_kv_heads) * HEAD_DIM
-    qkv = torch.empty(NUM_TOKENS, total_dim, dtype=BF16, device=DEVICE).uniform_(
+    qkv = torch.empty(num_tokens, total_dim, dtype=BF16, device=DEVICE).uniform_(
         -0.1, 0.1
     )
-    positions = torch.arange(NUM_TOKENS, dtype=torch.long, device=DEVICE)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=DEVICE)
     q_weight = torch.empty(HEAD_DIM, dtype=BF16, device=DEVICE).uniform_(0.8, 1.2)
     k_weight = torch.empty(HEAD_DIM, dtype=BF16, device=DEVICE).uniform_(0.8, 1.2)
     cos_sin_cache = _compute_cos_sin_cache(40960, HEAD_DIM, device=DEVICE).to(BF16)
@@ -180,91 +199,105 @@ def build_kernel(autotune_effort: str, autotune_budget_seconds: int):
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--autotune-effort", default="quick", choices=["none", "quick", "full"]
-    )
-    parser.add_argument("--autotune-budget-seconds", type=int, default=45)
-    args = parser.parse_args()
-
-    assert current_platform.is_xpu(), "This benchmark targets Intel XPU"
-
-    torch_ops_c_available = _probe_torch_ops_c()
-    if not torch_ops_c_available:
-        print(
-            "torch.ops._C.fused_qk_norm_rope is not available on this "
-            "platform (CUDA-only); reporting torch.compile(native) only, "
-            "no torch.ops._C column.\n"
-        )
-
-    kernel = build_kernel(args.autotune_effort, args.autotune_budget_seconds)
-
-    rows = []
-    detailed_rows: list[tuple[str, float, float]] = []
+def iter_cases(num_tokens_list: list[int]) -> Iterator[tuple[str, str, int, int, int]]:
+    """Yields (case_name, name, num_q_heads, num_kv_heads, num_tokens)."""
     for name, (num_q_heads, num_kv_heads) in MODEL_HEADS.items():
-        qkv, rest = make_inputs(num_q_heads, num_kv_heads)
-
-        compiled_qkv = qkv.clone()
-        _COMPILED_BASELINE(compiled_qkv, *rest)
-
-        # First call also triggers autotuning/compilation for this
-        # specialized shape.
-        test_qkv = qkv.clone()
-        kernel(test_qkv, *rest)
-        torch.xpu.synchronize()
-        err = rel_err(test_qkv, compiled_qkv)
-
-        compiled_buf = qkv.clone()
-        compiled_ms, compiled_graph = bench(
-            lambda buf=compiled_buf, r=rest: _COMPILED_BASELINE(buf, *r)
-        )
-
-        kern_buf = qkv.clone()
-        kern_ms, kern_graph = bench(lambda buf=kern_buf, r=rest: kernel(buf, *r))
-        xpu_graph_enabled = compiled_graph and kern_graph
-        speedup_vs_compiled = compiled_ms / kern_ms if kern_ms > 0 else 0.0
-
-        ops_c_ms = None
-        speedup_vs_ops_c = None
-        if torch_ops_c_available:
-            opsc_buf = qkv.clone()
-            ops_c_ms, _ = bench(
-                lambda buf=opsc_buf, r=rest: torch_ops_c_baseline(buf, *r)
+        for num_tokens in num_tokens_list:
+            case_name = (
+                f"num_q_heads_{num_q_heads}_num_kv_heads_{num_kv_heads}_"
+                f"num_tokens_{num_tokens}"
             )
-            speedup_vs_ops_c = ops_c_ms / kern_ms if kern_ms > 0 else 0.0
+            yield case_name, name, num_q_heads, num_kv_heads, num_tokens
 
-        case_name = (
-            f"num_q_heads_{num_q_heads}_num_kv_heads_{num_kv_heads}_"
-            f"num_tokens_{NUM_TOKENS}"
-        )
-        detailed_rows.append((case_name, compiled_ms, kern_ms))
-        rows.append(
-            (
-                name,
-                err,
-                compiled_ms,
-                ops_c_ms,
-                kern_ms,
-                speedup_vs_ops_c,
-                speedup_vs_compiled,
-                xpu_graph_enabled,
-            )
-        )
-        ops_c_str = f"{ops_c_ms:9.5f}" if ops_c_ms is not None else "      N/A"
-        speedup_c_str = (
-            f"{speedup_vs_ops_c:6.3f}x" if speedup_vs_ops_c is not None else "    N/A"
-        )
-        xpu_graph_str = "enabled" if xpu_graph_enabled else "disabled (fallback)"
-        print(
-            f"{name:12s} num_q_heads={num_q_heads:3d} num_kv_heads={num_kv_heads:2d} "
-            f"num_tokens={NUM_TOKENS:5d}  rel_err={err:.4f}  "
-            f"compiled_ms={compiled_ms:9.5f}  ops_c_ms={ops_c_str}  "
-            f"helion_ms={kern_ms:9.5f}  "
-            f"speedup_vs_compiled={speedup_vs_compiled:6.3f}x  "
-            f"speedup_vs_ops_c={speedup_c_str}  xpu_graph={xpu_graph_str}"
-        )
 
+def measure_case(
+    kernel,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_tokens: int,
+    torch_ops_c_available: bool,
+) -> tuple[float, float, float | None, float, float | None, float, bool]:
+    """Measures one (num_q_heads, num_kv_heads, num_tokens) case. Returns
+    (err, compiled_ms, ops_c_ms, kern_ms, speedup_vs_ops_c,
+    speedup_vs_compiled, xpu_graph_enabled). Raises on failure --
+    deliberately left uncaught here; see run_full_sweep.sh for how a
+    raised exception from --only-case is handled from outside the
+    process."""
+    qkv, rest = make_inputs(num_q_heads, num_kv_heads, num_tokens)
+
+    compiled_qkv = qkv.clone()
+    _COMPILED_BASELINE(compiled_qkv, *rest)
+
+    # First call also triggers autotuning/compilation for this
+    # specialized shape.
+    test_qkv = qkv.clone()
+    kernel(test_qkv, *rest)
+    torch.xpu.synchronize()
+    err = rel_err(test_qkv, compiled_qkv)
+
+    compiled_buf = qkv.clone()
+    compiled_ms, compiled_graph = bench(
+        lambda buf=compiled_buf, r=rest: _COMPILED_BASELINE(buf, *r)
+    )
+
+    kern_buf = qkv.clone()
+    kern_ms, kern_graph = bench(lambda buf=kern_buf, r=rest: kernel(buf, *r))
+    xpu_graph_enabled = compiled_graph and kern_graph
+    speedup_vs_compiled = compiled_ms / kern_ms if kern_ms > 0 else 0.0
+
+    ops_c_ms = None
+    speedup_vs_ops_c = None
+    if torch_ops_c_available:
+        opsc_buf = qkv.clone()
+        ops_c_ms, _ = bench(lambda buf=opsc_buf, r=rest: torch_ops_c_baseline(buf, *r))
+        speedup_vs_ops_c = ops_c_ms / kern_ms if kern_ms > 0 else 0.0
+
+    return (
+        err,
+        compiled_ms,
+        ops_c_ms,
+        kern_ms,
+        speedup_vs_ops_c,
+        speedup_vs_compiled,
+        xpu_graph_enabled,
+    )
+
+
+def _print_case_result(
+    name: str,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_tokens: int,
+    err: float,
+    compiled_ms: float,
+    ops_c_ms: float | None,
+    kern_ms: float,
+    speedup_vs_ops_c: float | None,
+    speedup_vs_compiled: float,
+    xpu_graph_enabled: bool,
+) -> None:
+    ops_c_str = f"{ops_c_ms:9.5f}" if ops_c_ms is not None else "      N/A"
+    speedup_c_str = (
+        f"{speedup_vs_ops_c:6.3f}x" if speedup_vs_ops_c is not None else "    N/A"
+    )
+    xpu_graph_str = "enabled" if xpu_graph_enabled else "disabled (fallback)"
+    print(
+        f"{name:12s} num_q_heads={num_q_heads:3d} num_kv_heads={num_kv_heads:2d} "
+        f"num_tokens={num_tokens:5d}  rel_err={err:.4f}  "
+        f"compiled_ms={compiled_ms:9.5f}  ops_c_ms={ops_c_str}  "
+        f"helion_ms={kern_ms:9.5f}  "
+        f"speedup_vs_compiled={speedup_vs_compiled:6.3f}x  "
+        f"speedup_vs_ops_c={speedup_c_str}  xpu_graph={xpu_graph_str}"
+    )
+
+
+def _print_summary_and_report(
+    rows: list[
+        tuple[str, float, float, float | None, float, float | None, float, bool]
+    ],
+    detailed_rows: list[tuple[str, float, float]],
+    n_not_attempted: int = 0,
+) -> None:
     speedups_compiled = [r[-2] for r in rows if r[-2] > 0]
     if speedups_compiled:
         geo = math.exp(sum(math.log(s) for s in speedups_compiled) / len(rows))
@@ -282,12 +315,178 @@ def main() -> None:
     print(f"max rel_err across all shapes: {max_err:.4f}")
     n_graph_enabled = sum(1 for r in rows if r[-1])
     print(f"xpu_graph enabled for {n_graph_enabled}/{len(rows)} shapes")
+    if n_not_attempted:
+        print(f"{n_not_attempted} case(s) FAILED or not yet attempted (see above)")
 
     print_detailed_report(
         hardware=current_platform.get_device_name(),
         baseline_name="torch.compile(baseline)",
         rows=detailed_rows,
     )
+
+
+def _report_from_sweep(sweep_file: str, num_tokens_list: list[int]) -> None:
+    results = load_sweep_results(sweep_file)
+    rows: list[tuple] = []
+    detailed_rows: list[tuple[str, float, float]] = []
+    n_not_attempted = 0
+    for case_name, name, num_q_heads, num_kv_heads, num_tokens in iter_cases(
+        num_tokens_list
+    ):
+        rec = results.get(case_name)
+        if rec is None or rec.get("status") != "ok":
+            n_not_attempted += 1
+            reason = "not attempted" if rec is None else "failed"
+            print(f"{case_name}: {reason}")
+            continue
+        rows.append(
+            (
+                name,
+                rec["rel_err"],
+                rec["compiled_ms"],
+                rec["ops_c_ms"],
+                rec["kernel_ms"],
+                rec["speedup_vs_ops_c"],
+                rec["speedup_vs_compiled"],
+                rec["xpu_graph_enabled"],
+            )
+        )
+        detailed_rows.append((case_name, rec["compiled_ms"], rec["kernel_ms"]))
+    _print_summary_and_report(rows, detailed_rows, n_not_attempted)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--autotune-effort", default="quick", choices=["none", "quick", "full"]
+    )
+    parser.add_argument("--autotune-budget-seconds", type=int, default=45)
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Sweep the full blog num_tokens grid (14 values, 1..8192) "
+        "instead of the default representative num_tokens=128.",
+    )
+    add_crash_safe_args(parser)
+    args = parser.parse_args()
+
+    num_tokens_list = NUM_TOKENS_FULL if args.full else NUM_TOKENS_QUICK
+
+    if args.list_cases:
+        for case_name, *_ in iter_cases(num_tokens_list):
+            print_case_name(case_name)
+        return
+
+    if args.report_from_sweep:
+        _report_from_sweep(args.report_from_sweep, num_tokens_list)
+        return
+
+    assert current_platform.is_xpu(), "This benchmark targets Intel XPU"
+
+    torch_ops_c_available = _probe_torch_ops_c()
+    if not torch_ops_c_available:
+        print(
+            "torch.ops._C.fused_qk_norm_rope is not available on this "
+            "platform (CUDA-only); reporting torch.compile(native) only, "
+            "no torch.ops._C column.\n"
+        )
+
+    kernel = build_kernel(args.autotune_effort, args.autotune_budget_seconds)
+
+    if args.only_case:
+        if not args.sweep_file:
+            raise SystemExit("--only-case requires --sweep-file")
+        for case_name, name, num_q_heads, num_kv_heads, num_tokens in iter_cases(
+            num_tokens_list
+        ):
+            if case_name != args.only_case:
+                continue
+            (
+                err,
+                compiled_ms,
+                ops_c_ms,
+                kern_ms,
+                speedup_vs_ops_c,
+                speedup_vs_compiled,
+                xpu_graph_enabled,
+            ) = measure_case(
+                kernel, num_q_heads, num_kv_heads, num_tokens, torch_ops_c_available
+            )
+            _print_case_result(
+                name,
+                num_q_heads,
+                num_kv_heads,
+                num_tokens,
+                err,
+                compiled_ms,
+                ops_c_ms,
+                kern_ms,
+                speedup_vs_ops_c,
+                speedup_vs_compiled,
+                xpu_graph_enabled,
+            )
+            append_sweep_result(
+                args.sweep_file,
+                case_name,
+                name=name,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                num_tokens=num_tokens,
+                rel_err=err,
+                compiled_ms=compiled_ms,
+                ops_c_ms=ops_c_ms,
+                kernel_ms=kern_ms,
+                speedup_vs_ops_c=speedup_vs_ops_c,
+                speedup_vs_compiled=speedup_vs_compiled,
+                xpu_graph_enabled=xpu_graph_enabled,
+            )
+            return
+        raise SystemExit(f"Unknown --only-case {args.only_case!r}")
+
+    rows = []
+    detailed_rows: list[tuple[str, float, float]] = []
+    for case_name, name, num_q_heads, num_kv_heads, num_tokens in iter_cases(
+        num_tokens_list
+    ):
+        (
+            err,
+            compiled_ms,
+            ops_c_ms,
+            kern_ms,
+            speedup_vs_ops_c,
+            speedup_vs_compiled,
+            xpu_graph_enabled,
+        ) = measure_case(
+            kernel, num_q_heads, num_kv_heads, num_tokens, torch_ops_c_available
+        )
+        detailed_rows.append((case_name, compiled_ms, kern_ms))
+        rows.append(
+            (
+                name,
+                err,
+                compiled_ms,
+                ops_c_ms,
+                kern_ms,
+                speedup_vs_ops_c,
+                speedup_vs_compiled,
+                xpu_graph_enabled,
+            )
+        )
+        _print_case_result(
+            name,
+            num_q_heads,
+            num_kv_heads,
+            num_tokens,
+            err,
+            compiled_ms,
+            ops_c_ms,
+            kern_ms,
+            speedup_vs_ops_c,
+            speedup_vs_compiled,
+            xpu_graph_enabled,
+        )
+
+    _print_summary_and_report(rows, detailed_rows)
 
 
 if __name__ == "__main__":
